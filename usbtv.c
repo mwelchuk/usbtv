@@ -94,6 +94,7 @@ struct usbtv {
 	struct v4l2_device v4l2_dev;
 	struct video_device vdev;
 	struct vb2_queue vb2q;
+	struct v4l2_fh *owner;
 	struct mutex v4l2_lock;
 	struct mutex vb2q_lock;
 
@@ -117,6 +118,196 @@ struct usbtv {
 	unsigned int sequence;
 	struct urb *isoc_urbs[USBTV_ISOC_TRANSFERS];
 };
+
+/*
+ * Include helper functions found in newer kernels
+ */
+/*
+ * The following functions are not part of the vb2 core API, but are helper
+ * functions that plug into struct v4l2_ioctl_ops, struct v4l2_file_operations
+ * and struct vb2_ops.
+ * They contain boilerplate code that most if not all drivers have to do
+ * and so they simplify the driver code.
+ */
+
+
+/* vb2 ioctl helpers */
+
+int vb2_ioctl_reqbufs(struct file *file, void *priv,
+			  struct v4l2_requestbuffers *p)
+{
+	struct usbtv *usbtv = video_drvdata(file);
+
+	return vb2_reqbufs(&usbtv->vb2q, p);
+}
+
+int vb2_ioctl_create_bufs(struct file *file, void *priv,
+			  struct v4l2_create_buffers *p)
+{
+	struct usbtv *usbtv = video_drvdata(file);
+	int res;
+
+	res = vb2_create_bufs(&usbtv->vb2q, p);
+	if (res == 0)
+		usbtv->owner = file->private_data;
+	return res;
+}
+
+int vb2_ioctl_prepare_buf(struct file *file, void *priv,
+			  struct v4l2_buffer *p)
+{
+	struct video_device *vdev = video_devdata(file);
+	struct usbtv *usbtv = container_of(vdev, struct usbtv, vdev);
+
+	return vb2_prepare_buf(&usbtv->vb2q, p);
+}
+
+int vb2_ioctl_querybuf(struct file *file, void *priv, struct v4l2_buffer *p)
+{
+	struct video_device *vdev = video_devdata(file);
+	struct usbtv *usbtv = container_of(vdev, struct usbtv, vdev);
+
+	return vb2_querybuf(&usbtv->vb2q, p);
+}
+
+int vb2_ioctl_qbuf(struct file *file, void *priv, struct v4l2_buffer *p)
+{
+	struct video_device *vdev = video_devdata(file);
+	struct usbtv *usbtv = container_of(vdev, struct usbtv, vdev);
+
+	return vb2_qbuf(&usbtv->vb2q, p);
+}
+
+int vb2_ioctl_dqbuf(struct file *file, void *priv, struct v4l2_buffer *p)
+{
+	struct video_device *vdev = video_devdata(file);
+	struct usbtv *usbtv = container_of(vdev, struct usbtv, vdev);
+
+	return vb2_dqbuf(&usbtv->vb2q, p, file->f_flags & O_NONBLOCK);
+}
+
+int vb2_ioctl_streamon(struct file *file, void *priv, enum v4l2_buf_type i)
+{
+	struct video_device *vdev = video_devdata(file);
+	struct usbtv *usbtv = container_of(vdev, struct usbtv, vdev);
+
+	return vb2_streamon(&usbtv->vb2q, i);
+}
+
+int vb2_ioctl_streamoff(struct file *file, void *priv, enum v4l2_buf_type i)
+{
+	struct video_device *vdev = video_devdata(file);
+	struct usbtv *usbtv = container_of(vdev, struct usbtv, vdev);
+
+	return vb2_streamoff(&usbtv->vb2q, i);
+}
+
+/* v4l2_file_operations helpers */
+
+int vb2_fop_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	struct video_device *vdev = video_devdata(file);
+	struct usbtv *usbtv = container_of(vdev, struct usbtv, vdev);
+
+	return vb2_mmap(&usbtv->vb2q, vma);
+}
+
+int vb2_fop_release(struct file *file)
+{
+	struct video_device *vdev = video_devdata(file);
+	struct usbtv *usbtv = container_of(vdev, struct usbtv, vdev);
+
+	if (file->private_data == usbtv->owner) {
+		vb2_queue_release(&usbtv->vb2q);
+		usbtv->owner = NULL;
+	}
+	return v4l2_fh_release(file);
+}
+
+ssize_t vb2_fop_write(struct file *file, char __user *buf,
+		size_t count, loff_t *ppos)
+{
+	struct video_device *vdev = video_devdata(file);
+	struct usbtv *usbtv = container_of(vdev, struct usbtv, vdev);
+	struct mutex *lock = &usbtv->vb2q_lock ? &usbtv->vb2q_lock : vdev->lock;
+	bool must_lock = lock;
+	int err = -EBUSY;
+
+	if (must_lock && mutex_lock_interruptible(lock))
+		return -ERESTARTSYS;
+	err = vb2_write(&usbtv->vb2q, buf, count, ppos,
+		       file->f_flags & O_NONBLOCK);
+	if (err >= 0)
+		usbtv->owner = file->private_data;
+	if (must_lock)
+		mutex_unlock(lock);
+	return err;
+}
+
+ssize_t vb2_fop_read(struct file *file, char __user *buf,
+		size_t count, loff_t *ppos)
+{
+	struct video_device *vdev = video_devdata(file);
+	struct usbtv *usbtv = container_of(vdev, struct usbtv, vdev);
+	struct mutex *lock = &usbtv->vb2q_lock ? &usbtv->vb2q_lock : vdev->lock;
+	bool must_lock = vdev->lock;
+	int err = -EBUSY;
+
+	if (must_lock && mutex_lock_interruptible(lock))
+		return -ERESTARTSYS;
+	err = vb2_read(&usbtv->vb2q, buf, count, ppos,
+		       file->f_flags & O_NONBLOCK);
+	if (err >= 0)
+		usbtv->owner = file->private_data;
+	if (must_lock)
+		mutex_unlock(lock);
+	return err;
+}
+
+unsigned int vb2_fop_poll(struct file *file, poll_table *wait)
+{
+	struct video_device *vdev = video_devdata(file);
+	struct usbtv *usbtv = container_of(vdev, struct usbtv, vdev);
+	struct vb2_queue *q = &usbtv->vb2q;
+	struct mutex *lock = &usbtv->vb2q_lock ? &usbtv->vb2q_lock : vdev->lock;
+	unsigned res;
+	void *fileio;
+	/* Yuck. We really need to get rid of this flag asap. If it is
+	   set, then the core took the serialization lock before calling
+	   poll(). This is being phased out, but for now we have to handle
+	   this case. */
+	bool must_lock = false;
+
+	/* Try to be smart: only lock if polling might start fileio,
+	   otherwise locking will only introduce unwanted delays. */
+	if (q->num_buffers == 0 && q->fileio == NULL) {
+		if (!V4L2_TYPE_IS_OUTPUT(q->type) && (q->io_modes & VB2_READ) &&
+				(POLLIN | POLLRDNORM))
+			must_lock = true;
+		else if (V4L2_TYPE_IS_OUTPUT(q->type) && (q->io_modes & VB2_WRITE) &&
+				(POLLOUT | POLLWRNORM))
+			must_lock = true;
+	}
+
+	/* If locking is needed, but this helper doesn't know how, then you
+	   shouldn't be using this helper but you should write your own. */
+	WARN_ON(must_lock && !lock);
+
+	if (must_lock && lock && mutex_lock_interruptible(lock))
+		return POLLERR;
+
+	fileio = q->fileio;
+
+	res = vb2_poll(&usbtv->vb2q, file, wait);
+
+	/* If fileio was started, then we have a new queue owner. */
+	if (must_lock && !fileio && q->fileio)
+		usbtv->owner = file->private_data;
+	if (must_lock && lock)
+		mutex_unlock(lock);
+	return res;
+}
+
 
 static int usbtv_configure_for_norm(struct usbtv *usbtv, v4l2_std_id norm)
 {
@@ -363,6 +554,15 @@ static void usbtv_chunk_to_vbuf(u32 *frame, u32 *src, int chunk_no, int odd)
 	}
 }
 
+void v4l2_get_timestamp(struct timeval *tv)
+{
+	struct timespec ts;
+
+	ktime_get_ts(&ts);
+	tv->tv_sec = ts.tv_sec;
+	tv->tv_usec = ts.tv_nsec / NSEC_PER_USEC;
+}
+
 /* Called for each 256-byte image chunk.
  * First word identifies the chunk, followed by 240 words of image
  * data and padding. */
@@ -574,9 +774,8 @@ static int usbtv_querycap(struct file *file, void *priv,
 	strlcpy(cap->driver, "usbtv", sizeof(cap->driver));
 	strlcpy(cap->card, "usbtv", sizeof(cap->card));
 	usb_make_path(dev->udev, cap->bus_info, sizeof(cap->bus_info));
-	cap->device_caps = V4L2_CAP_VIDEO_CAPTURE;
-	cap->device_caps |= V4L2_CAP_READWRITE | V4L2_CAP_STREAMING;
-	cap->capabilities = cap->device_caps | V4L2_CAP_DEVICE_CAPS;
+	cap->capabilities = V4L2_CAP_VIDEO_CAPTURE;
+	cap->capabilities |= V4L2_CAP_READWRITE | V4L2_CAP_STREAMING;
 	return 0;
 }
 
@@ -767,6 +966,8 @@ static int usbtv_probe(struct usb_interface *intf,
 	struct device *dev = &intf->dev;
 	struct usbtv *usbtv;
 
+	printk("Probe routine\n");
+
 	/* Checks that the device is what we think it is. */
 	if (intf->num_altsetting != 2)
 		return -ENODEV;
@@ -801,8 +1002,6 @@ static int usbtv_probe(struct usb_interface *intf,
 	usbtv->vb2q.buf_struct_size = sizeof(struct usbtv_buf);
 	usbtv->vb2q.ops = &usbtv_vb2_ops;
 	usbtv->vb2q.mem_ops = &vb2_vmalloc_memops;
-	usbtv->vb2q.timestamp_type = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
-	usbtv->vb2q.lock = &usbtv->vb2q_lock;
 	ret = vb2_queue_init(&usbtv->vb2q);
 	if (ret < 0) {
 		dev_warn(dev, "Could not initialize videobuf2 queue\n");
@@ -826,7 +1025,6 @@ static int usbtv_probe(struct usb_interface *intf,
 	usbtv->vdev.fops = &usbtv_fops;
 	usbtv->vdev.ioctl_ops = &usbtv_ioctl_ops;
 	usbtv->vdev.tvnorms = USBTV_TV_STD;
-	usbtv->vdev.queue = &usbtv->vb2q;
 	usbtv->vdev.lock = &usbtv->v4l2_lock;
 	set_bit(V4L2_FL_USE_FH_PRIO, &usbtv->vdev.flags);
 	video_set_drvdata(&usbtv->vdev, usbtv);
@@ -869,10 +1067,6 @@ static void usbtv_disconnect(struct usb_interface *intf)
 	v4l2_device_put(&usbtv->v4l2_dev);
 }
 
-MODULE_AUTHOR("Lubomir Rintel");
-MODULE_DESCRIPTION("Fushicai USBTV007 Video Grabber Driver");
-MODULE_LICENSE("Dual BSD/GPL");
-
 struct usb_driver usbtv_usb_driver = {
 	.name = "usbtv",
 	.id_table = usbtv_id_table,
@@ -880,4 +1074,28 @@ struct usb_driver usbtv_usb_driver = {
 	.disconnect = usbtv_disconnect,
 };
 
-module_usb_driver(usbtv_usb_driver);
+static int __init usbtv_init(void)
+{
+	int retval;
+	retval = usb_register(&usbtv_usb_driver);
+	if (retval)
+		goto out;
+
+	printk(KERN_INFO KBUILD_MODNAME ": Loaded\n");
+
+out:
+	return retval;
+}
+
+static void __exit usbtv_exit(void)
+{
+	usb_deregister(&usbtv_usb_driver);
+}
+
+module_init(usbtv_init);
+module_exit(usbtv_exit);
+
+MODULE_AUTHOR("Lubomir Rintel");
+MODULE_DESCRIPTION("Fushicai USBTV007 Video Grabber Driver");
+MODULE_LICENSE("Dual BSD/GPL");
+
