@@ -1,0 +1,2 @@
+obj-m := usbtv.o
+

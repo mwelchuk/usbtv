@@ -1,0 +1,19 @@
+This is a backported driver for the Fushicai USBTV007 Video Grabber, sold as one of the "EasyCAP" USB devices.
+
+The initial code copied from v3.14-rc5-232-gb053940 and backported to the 3.2 kernel (as used in Ubuntu 12.04 LTS, which was the purpose for this backporting exercise).
+
+Installation
+------------
+
+The driver can be built and installed using DKMS. The following commands can be used to install dkms, build and install the driver. Installing the module this way should cause the driver to be rebuilt and installed automatically when the kernel is updated.
+
+Extract these sources into "/usr/src/usbtv-1.0". Run the follwoing commands:
+
+$ sudo -i
+# apt-get install dkms
+# dkms add -m usbtv -v 1.0
+# dkms build -m usbtv -v 1.0
+# dkms install -m usbtv -v 1.0
+# chkconfig dkms_autoinstaller on
+
+
